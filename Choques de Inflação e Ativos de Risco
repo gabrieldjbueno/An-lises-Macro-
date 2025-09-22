@@ -1,0 +1,190 @@
+# =============================================================================
+# Choques de inflação (ΔCPI YoY ≥ 0,50pp) — EUA
+# Gráfico 1: CPI YoY (preto tracejado) + ativos base 100 com sombreados dos choques
+# Gráfico 2: barras com retorno MÉDIO 3m/6m/12m pós-choque
+# Fontes: FRED (CPIAUCSL) e Yahoo Finance | Elaboração: Santa Fé Investimentos
+# Requisitos: pip install pandas pandas_datareader yfinance matplotlib
+# =============================================================================
+
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import yfinance as yf
+from pandas_datareader import data as pdr
+
+# ------------------------
+# Parâmetros
+# ------------------------
+START = "2000-01-01"
+END = datetime.today().strftime("%Y-%m-%d")
+ACCEL_THRESHOLD_PP = 0.50          # choque de inflação = 0,50 pp no mês
+HORIZONS = [3, 6, 12]              # janelas para o estudo
+
+ASSETS = {
+    "S&P500": "^GSPC",
+    "Ouro": "GC=F",
+    "Brent": "BZ=F",
+    "Soja": "ZS=F",
+}
+
+# ------------------------
+# CPI YoY (12m) — FRED (mensal)
+# ------------------------
+cpi = pdr.DataReader("CPIAUCSL", "fred", START, END).dropna()
+cpi_yoy = (cpi.pct_change(12) * 100.0).dropna()
+cpi_yoy.columns = ["CPI_YoY_%"]
+
+# PeriodIndex para alinhar por mês
+cpi_yoy["Period"] = cpi_yoy.index.to_period("M")
+cpi_m = cpi_yoy.groupby("Period").last()[["CPI_YoY_%"]]
+dcpi_m = cpi_m["CPI_YoY_%"].diff()
+events = cpi_m.index[dcpi_m >= ACCEL_THRESHOLD_PP]                   # PeriodIndex ('M')
+
+# ------------------------
+# Preços (Yahoo) → mensal (ME), alinhamento e base 100
+# ------------------------
+def get_close_prices(yf_df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(yf_df.columns, pd.MultiIndex):
+        lvl1 = yf_df.columns.get_level_values(1)
+        if "Close" in set(lvl1):
+            return yf_df.xs("Close", axis=1, level=1)
+        elif "Adj Close" in set(lvl1):
+            return yf_df.xs("Adj Close", axis=1, level=1)
+        else:
+            return yf_df.xs(lvl1[-1], axis=1, level=1)
+    return yf_df
+
+raw = yf.download(list(ASSETS.values()), start=START, end=END,
+                  auto_adjust=True, group_by="ticker", progress=False, threads=True)
+px = get_close_prices(raw)
+if isinstance(px, pd.Series):
+    px = px.to_frame()
+
+name_map = {v: k for k, v in ASSETS.items()}
+px.columns = [name_map.get(c, c) for c in px.columns]
+
+px_me = px.resample("ME").last().ffill()
+px_me.index = px_me.index.to_period("M")
+
+# alinhar por período
+common = px_me.index.intersection(cpi_m.index)
+prices = px_me.reindex(common).dropna(how="all").ffill()
+cpi_al = cpi_m.reindex(common)
+events = events.intersection(common)                                  # garante que existam preços nos eventos
+
+# base 100 por série (na 1ª observação válida de cada uma)
+px_base100 = prices.copy()
+for col in px_base100.columns:
+    first_valid = px_base100[col].dropna().iloc[0]
+    px_base100[col] = (px_base100[col] / first_valid) * 100.0
+
+# eixo x (timestamp fim de mês) para os plots
+idx_ts = common.to_timestamp("M")
+
+# ------------------------
+# GRÁFICO 1 — Linha com CPI (preto tracejado) + ativos base 100 e sombreados
+# ------------------------
+fig, ax1 = plt.subplots(figsize=(11, 6))
+
+# CPI YoY — destaque
+ax1.plot(idx_ts, cpi_al["CPI_YoY_%"], label="CPI YoY (12m)",
+         color="black", linestyle="--", linewidth=2)
+ax1.set_xlabel("Data")
+ax1.set_ylabel("CPI YoY (% a.a.)")
+ax1.grid(True, alpha=0.3)
+
+# Ativos no eixo secundário
+ax2 = ax1.twinx()
+for col in px_base100.columns:
+    ax2.plot(idx_ts, px_base100[col], label=col, linewidth=2)
+ax2.set_ylabel("Índice (base = 100 na 1ª observação válida)")
+
+# Sombreamento dos meses de choque (mês inteiro)
+for p in events:
+    ax1.axvspan(p.start_time, p.end_time, color="grey", alpha=0.15, zorder=0)
+
+# Legenda combinada + item para o sombreado
+handles = ax1.get_lines() + ax2.get_lines()
+labels = [h.get_label() for h in handles]
+handles.append(Patch(facecolor="grey", alpha=0.15, label="Choque de inflação"))
+labels.append("Choque de inflação")
+ax1.legend(handles, labels, loc="upper left", frameon=False)
+
+fig.text(0.01, -0.02,
+         "Fonte: FRED (CPIAUCSL) e Yahoo Finance | Elaboração: Santa Fé Investimentos",
+         ha="left", va="bottom", fontsize=9, alpha=0.9)
+
+plt.title("Inflação EUA (CPI 12m) vs S&P500, Ouro, Brent e Soja — Choques de inflação (ΔCPI YoY ≥ 0,50pp)",
+          fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# ------------------------
+# EVENT STUDY — retornos médios 3m/6m/12m pós-choque
+# ------------------------
+def fwd_return(price_df: pd.DataFrame, asset: str, base_period, m_ahead: int):
+    idx = price_df.index
+    if base_period not in idx:
+        return np.nan
+    i0 = idx.get_loc(base_period)
+    i1 = i0 + m_ahead
+    if i1 >= len(idx):
+        return np.nan
+    p0 = price_df.iloc[i0][asset]
+    p1 = price_df.iloc[i1][asset]
+    return (p1 / p0) - 1.0
+
+rows = []
+for asset in prices.columns:
+    row = {"Ativo": asset}
+    for h in HORIZONS:
+        vals = []
+        for t in events:
+            r = fwd_return(prices, asset, t, h)
+            if pd.notna(r):
+                vals.append(r)
+        row[f"Avg {h}m (%)"] = (np.mean(vals) * 100.0) if vals else np.nan
+    rows.append(row)
+
+tbl = pd.DataFrame(rows).set_index("Ativo").loc[list(ASSETS.keys())]
+print("\n=== Retorno MÉDIO após choques de inflação (ΔCPI YoY ≥ "
+      f"{ACCEL_THRESHOLD_PP:.2f}pp) ===")
+print(tbl.round(2))
+
+# ------------------------
+# GRÁFICO 2 — Único gráfico de barras compilando 3m/6m/12m
+# ------------------------
+fig, ax = plt.subplots(figsize=(9.5, 5.8))
+
+x = np.arange(len(tbl.index))
+width = 0.25
+
+bars = []
+for i, h in enumerate(HORIZONS):
+    vals = tbl[f"Avg {h}m (%)"].values
+    b = ax.bar(x + (i - (len(HORIZONS)-1)/2)*width, vals, width, label=f"{h}m")
+    bars.append(b)
+
+# rótulos em cada barra
+for b in bars:
+    for rect in b:
+        height = rect.get_height()
+        ax.text(rect.get_x() + rect.get_width()/2, height,
+                f"{height:.1f}%", ha="center", va="bottom", fontsize=9)
+
+ax.set_xticks(x)
+ax.set_xticklabels(tbl.index)
+ax.set_ylabel("Retorno médio (%) após choque")
+ax.set_title("Quem anda mais quando a inflação dispara? (ΔCPI YoY ≥ 0,50pp)",
+             fontsize=12, fontweight="bold")
+ax.legend(title="Horizonte")
+ax.grid(True, axis="y", alpha=0.3)
+
+fig.text(0.01, -0.02,
+         "Fonte: FRED (CPIAUCSL) e Yahoo Finance | Elaboração: Santa Fé Investimentos",
+         ha="left", va="bottom", fontsize=8.5, alpha=0.9)
+
+plt.tight_layout()
+plt.show()
