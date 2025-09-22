@@ -1,0 +1,152 @@
+# -*- coding: utf-8 -*-
+# S&P 500 nos DIAS de INÍCIO de ciclo do Fed (cortes/altas) desde 2000
+# Cores: altas=vermelho, cortes=azul, média=verde, mediana=amarelo
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from dateutil.parser import parse
+from matplotlib.patches import Patch
+
+# ===== 1) Datas de INÍCIO DE CICLO desde 1990 =====
+cycle_starts = [
+    "1994-02-04",  # altas (Greenspan, inflação)
+    "1999-06-30",  # altas (pré-bolha tech)
+    "2001-01-03",  # cortes (dotcom, choque)
+    "2004-06-30",  # altas (medida e moderada)
+    "2007-09-18",  # cortes (GFC)
+    "2015-12-16",  # altas (pós-ZLB)
+    "2019-07-31",  # cortes ("mid-cycle")
+    "2020-03-03",  # cortes (COVID emergência)
+    "2022-03-16",  # altas (pós-pandemia)
+    "2024-09-18",  # cortes (pós-inflação)
+]
+dates = sorted(pd.to_datetime([parse(d).date() for d in cycle_starts]))
+
+# Classificação
+hikes = {
+    pd.to_datetime("1994-02-04"),
+    pd.to_datetime("1999-06-30"),
+    pd.to_datetime("2004-06-30"),
+    pd.to_datetime("2015-12-16"),
+    pd.to_datetime("2022-03-16"),
+}
+cuts = {
+    pd.to_datetime("2001-01-03"),
+    pd.to_datetime("2007-09-18"),
+    pd.to_datetime("2019-07-31"),
+    pd.to_datetime("2020-03-03"),
+    pd.to_datetime("2024-09-18"),
+}
+
+# 2) Baixa S&P500 (^GSPC) e padroniza colunas
+start = (pd.to_datetime(min(dates)) - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+end   = (pd.to_datetime(max(dates)) + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+
+spx = yf.download("^GSPC", start=start, end=end, progress=False, auto_adjust=False)
+
+# Se vier MultiIndex, achata
+if isinstance(spx.columns, pd.MultiIndex):
+    spx.columns = spx.columns.get_level_values(0)
+spx.columns = [c.lower() for c in spx.columns]
+
+# Usa 'adj close' se existir, senão 'close'
+col = 'adj close' if 'adj close' in spx.columns else 'close'
+spx = spx[[col]].rename(columns={col: 'AdjClose'})
+spx.index = pd.to_datetime(spx.index.date)
+
+# 3) Util: próximo pregão >= data
+def next_trading_day(idx, d):
+    d = pd.to_datetime(d)
+    i = idx.searchsorted(d, side='left')
+    if i >= len(idx):
+        return None
+    return idx[i]
+
+# 4) Calcula retorno do DIA DO ANÚNCIO (Close(t)/Close(t-1)-1)
+rows = []
+for d in dates:
+    td = next_trading_day(spx.index, d)
+    if td is None:
+        rows.append({"Data": pd.to_datetime(d), "Retorno": np.nan, "Obs": "sem dado"})
+        continue
+    i = spx.index.get_loc(td)
+    prev = spx.index[i-1] if i > 0 else None
+    ret = np.nan if prev is None else spx.loc[td, "AdjClose"] / spx.loc[prev, "AdjClose"] - 1.0
+    rows.append({"Data": pd.to_datetime(d), "Retorno": float(ret) if pd.notna(ret) else np.nan, "Obs": ""})
+
+df = pd.DataFrame(rows).sort_values("Data").reset_index(drop=True)
+df["Label"] = df["Retorno"].map(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "NA")
+
+# 5) Média e mediana
+mean_ret = float(np.nanmean(df["Retorno"]))
+median_ret = float(np.nanmedian(df["Retorno"]))
+
+df_extra = pd.DataFrame({
+    "Data":   [pd.NaT, pd.NaT],
+    "Retorno":[mean_ret, median_ret],
+    "Obs":    ["MÉDIA", "MEDIANA"],
+    "Label":  [f"{mean_ret*100:.2f}%", f"{median_ret*100:.2f}%"]
+})
+
+plot_df = pd.concat([df, df_extra], ignore_index=True)
+
+# 6) Cores por barra
+colors = []
+for _, row in plot_df.iloc[:-2].iterrows():  # apenas as datas (sem média/mediana)
+    d = row["Data"]
+    if d in hikes:
+        colors.append("red")      # altas
+    elif d in cuts:
+        colors.append("blue")     # cortes
+    else:
+        colors.append("gray")     # fallback (não deve ocorrer)
+# adiciona cores de média e mediana
+colors += ["green", "yellow"]
+
+# 7) Eixo X
+xlabels = plot_df["Data"].dt.strftime("%Y-%m-%d").where(plot_df["Data"].notna(), plot_df["Obs"])
+x = np.arange(len(plot_df))
+
+# 8) Plot
+plt.figure(figsize=(14, 6))
+bars = plt.bar(x, plot_df["Retorno"]*100, color=colors)  # em %
+
+# Rótulos nas barras (mais próximos ao topo)
+for bar, txt in zip(bars, plot_df["Label"]):
+    h = bar.get_height()
+    if np.isnan(h):
+        continue
+    va = "bottom" if h >= 0 else "top"
+    # deslocamento proporcional à altura da barra
+    offset = 0.02 * h if h != 0 else 0.2
+    plt.text(
+        bar.get_x() + bar.get_width()/2,
+        h + offset,
+        txt,
+        ha="center", va=va, fontsize=9
+    )
+
+plt.xticks(x, xlabels, rotation=45, ha="right")
+plt.ylabel("Retorno do S&P 500 no dia do anúncio (%)")
+plt.title("S&P 500: performance nos DIAS de INÍCIO de ciclo do Fed (2001–presente)")
+plt.grid(axis="y", linestyle="--", alpha=0.3)
+
+# Legenda manual
+legend_patches = [
+    Patch(facecolor="red",    label="Início de ALTA de juros"),
+    Patch(facecolor="blue",   label="Início de CORTE de juros"),
+    Patch(facecolor="green",  label="MÉDIA"),
+    Patch(facecolor="yellow", label="MEDIANA"),
+]
+plt.legend(handles=legend_patches, loc="best")
+
+caption = ("Fontes: Federal Reserve (FOMC statements) e Yahoo Finance | "
+           "Metodologia: retorno do dia = fechamento do anúncio vs. fechamento anterior | "
+           "Elaboração: Santa Fé Investimentos")
+plt.figtext(0.5, -0.05, caption, ha="center", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
