@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+"""
+Efeito pós-cortes do Fed (desde 2000) em Brent, Soja, Minério 62% e S&P 500.
+
+Metodologia:
+- Para cada ciclo de cortes (início/fim por reunião), medimos a performance
+  A PARTIR DO DIA SEGUINTE AO FIM DO CICLO (t+1) em +6, +12 e +24 meses.
+- Também geramos 1 gráfico único desde 2000 com faixas sombreadas nos períodos de cortes.
+
+Requisitos:
+pip install yfinance pandas numpy matplotlib openpyxl
+"""
+
+import sys, subprocess
+def _pip_install(pkg):
+    try:
+        __import__(pkg.split("==")[0].split(">=")[0])
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+for pkg in ["pandas", "numpy", "yfinance", "matplotlib", "openpyxl"]:
+    _pip_install(pkg)
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# ---------------- Config ----------------
+START_BACKFILL = "2000-01-01"
+ASSETS = {
+    "Brent (BZ=F)": "BZ=F",
+    "Soja (ZS=F)": "ZS=F",
+    "Minério 62% (TIO=F)": "TIO=F",   # se falhar, tente "IO=F"
+    "S&P 500 (^GSPC)": "^GSPC",
+}
+HORIZONTES_MESES = [6, 12, 24]        # janelas pós-corte
+FOOTER = "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos"
+PLOT_SHADED_CYCLES = True
+
+# Ciclos de cortes do Fed (datas de reunião + taxas para cálculo de bps)
+FED_CUT_CYCLES = [
+    {"nome": "Pós-dotcom/11-set",          "inicio": "2001-01-03", "fim": "2003-06-25", "start_rate": 6.50, "end_rate": 1.00},
+    {"nome": "Crise financeira",           "inicio": "2007-09-18", "fim": "2008-12-16", "start_rate": 5.25, "end_rate": 0.25},
+    {"nome": "Ajuste de meio de ciclo",    "inicio": "2019-07-31", "fim": "2019-10-30", "start_rate": 2.50, "end_rate": 1.75},
+    {"nome": "COVID (emergência)",         "inicio": "2020-03-03", "fim": "2020-03-15", "start_rate": 1.75, "end_rate": 0.25},
+    {"nome": "Pós-inflação 2022 (fase 1)", "inicio": "2024-09-18", "fim": "2024-12-18", "start_rate": 5.50, "end_rate": 4.50},
+]
+
+# ---------------- Helpers ----------------
+def download_series(ticker: str, start=START_BACKFILL) -> pd.Series:
+    try:
+        df = yf.download(ticker, start=start, auto_adjust=False, progress=False)
+        s = df.get("Adj Close")
+        if s is None or s.empty:
+            print(f"[WARN] Série vazia/não encontrada para {ticker}.")
+            return pd.Series(dtype=float)
+        s = s.dropna()
+        s.index = pd.to_datetime(s.index)
+        return s
+    except Exception as e:
+        print(f"[WARN] Falha ao baixar {ticker}: {e}")
+        return pd.Series(dtype=float)
+
+def nearest(series: pd.Series, date, side="left"):
+    """Retorna o valor mais próximo: 'left' <= date ; 'right' >= date."""
+    if series.empty:
+        return np.nan
+    idx = series.index
+    date = pd.to_datetime(date)
+    pos = idx.searchsorted(date, side='right' if side=="right" else 'left')
+    if side == "left":
+        pos = min(max(pos-1, 0), len(idx)-1)
+    else:
+        pos = min(max(pos, 0), len(idx)-1)
+    try:
+        return float(series.iloc[pos])
+    except Exception:
+        v = series.iloc[pos]
+        return float(np.asarray(v).squeeze())
+
+def price_on_or_after(series: pd.Series, date):
+    """Primeiro preço >= date."""
+    return nearest(series, date, side="right")
+
+def price_on_or_before(series: pd.Series, date):
+    """Último preço <= date."""
+    return nearest(series, date, side="left")
+
+def ret_between_dates(series: pd.Series, d0, d1) -> float:
+    """Retorno percentual entre d0 (>=) e d1 (<=)."""
+    if series.empty:
+        return np.nan
+    p0 = price_on_or_after(series, d0)
+    p1 = price_on_or_before(series, d1)
+    if (pd.isna(p0) or pd.isna(p1) or p0 == 0):
+        return np.nan
+    return (p1 / p0 - 1.0) * 100.0
+
+def add_months(date_str: str, months: int) -> pd.Timestamp:
+    return pd.to_datetime(date_str) + pd.DateOffset(months=months)
+
+# ---------------- Baixar séries ----------------
+print("Baixando séries do Yahoo Finance...")
+series_map = {label: download_series(tkr, START_BACKFILL) for label, tkr in ASSETS.items()}
+
+# ---------------- Tabela de retornos pós-corte ----------------
+linhas = []
+for cyc in FED_CUT_CYCLES:
+    fim = pd.to_datetime(cyc["fim"])
+    start_after = fim + pd.Timedelta(days=1)  # dia útil seguinte (ou próximo disponível via 'price_on_or_after')
+
+    base = {
+        "Ciclo": cyc["nome"],
+        "Início (reunião)": cyc["inicio"],
+        "Fim (reunião)": cyc["fim"],
+        "Corte total (bps)": round((cyc["start_rate"] - cyc["end_rate"]) * 100.0, 0),
+    }
+
+    # Para cada horizonte, calculamos retornos dos ativos
+    for h in HORIZONTES_MESES:
+        end_h = add_months(start_after, h)
+        for asset_name, s in series_map.items():
+            r = ret_between_dates(s, start_after, end_h)
+            base[f"{asset_name} | +{h}m"] = None if pd.isna(r) else round(r, 2)
+    linhas.append(base)
+
+df = pd.DataFrame(linhas)
+
+# Adiciona linha de média (somente colunas de retornos)
+ret_cols = [c for c in df.columns if "|" in c]
+media = {col: round(pd.to_numeric(df[col], errors="coerce").mean(skipna=True), 2) for col in ret_cols}
+media.update({"Ciclo": "Média", "Início (reunião)": "", "Fim (reunião)": "", "Corte total (bps)": ""})
+df = pd.concat([df, pd.DataFrame([media])], ignore_index=True)
+
+# Ordena colunas: metadados primeiro, depois retornos
+cols = ["Ciclo", "Início (reunião)", "Fim (reunião)", "Corte total (bps)"] + ret_cols
+df = df[cols]
+
+print("\n=== Retornos pós-corte do Fed (%, do dia após o fim do ciclo) ===")
+print(df.to_string(index=False))
+
+# Salvar
+df.to_csv("pos_cortes_fed_commodities_sp500.csv", index=False, encoding="utf-8-sig")
+with pd.ExcelWriter("pos_cortes_fed_commodities_sp500.xlsx", engine="openpyxl") as xw:
+    df.to_excel(xw, index=False, sheet_name="Resultados")
+
+# ---------------- Gráfico único desde 2000 ----------------
+plt.rcParams["figure.figsize"] = (12, 7)
+plt.rcParams["axes.grid"] = True
+
+fig, ax = plt.subplots()
+# Normalizar cada ativo = 100 em START_BACKFILL
+for name, s in series_map.items():
+    if s.empty:
+        continue
+    s2 = s.copy()
+    s2 = s2[s2.index >= pd.to_datetime(START_BACKFILL)]
+    if s2.empty:
+        continue
+    base = float(s2.iloc[0])
+    if base == 0 or pd.isna(base):
+        continue
+    idx_series = (s2 / base) * 100.0
+    ax.plot(idx_series.index, idx_series.values, label=name, linewidth=2)
+
+# Faixas sombreadas nos períodos de cortes (opcional)
+if PLOT_SHADED_CYCLES:
+    ymin, ymax = ax.get_ylim()
+    for cyc in FED_CUT_CYCLES:
+        x0 = pd.to_datetime(cyc["inicio"])
+        x1 = pd.to_datetime(cyc["fim"])
+        ax.axvspan(x0, x1, alpha=0.12)  # sem cor específica definida
+
+ax.set_title("Ativos desde 2000 (base 100 no início) — cortes do Fed sombreados")
+ax.set_ylabel("Índice (início = 100)")
+ax.legend(loc="best", frameon=True)
+fig.text(0.01, 0.01, FOOTER, fontsize=9)
+plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+plt.show()
+
+print("\nArquivos gerados:")
+print(" - pos_cortes_fed_commodities_sp500.csv")
+print(" - pos_cortes_fed_commodities_sp500.xlsx")
+print(" - (gráfico exibido na tela; salve via botão se desejar)")
