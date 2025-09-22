@@ -1,0 +1,151 @@
+"""
+Estudo: Diferencial de juros Brasil x EUA vs câmbio BRL/USD (2000-01-01 até hoje)
+Pipeline 100% FRED em frequência MENSAL (robusto e estável):
+- Brasil (proxy Selic): IRSTCB01BRM156N — OECD Central Bank Immediate Rate (mensal)
+- EUA (piso do intervalo alvo): DFEDTARL — Federal Funds Target Range - Lower Limit (diário → agregado p/ mensal)
+- Câmbio BRL/USD: DEXBZUS — Spot rate (diário → agregado p/ mensal)
+
+Saídas:
+1) CSV com painel mensal completo (Selic proxy, piso Fed, BRL/USD e spread em p.p.)
+2) PNG com gráfico (BRL/USD no eixo esquerdo; spread no eixo direito)
+3) Correlações (12m, 24m, full) impressas no console
+"""
+
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
+from pandas_datareader import data as pdr
+
+START_DATE = "2000-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+
+FRED_SERIES = {
+    "fed_lower_daily": "DFEDTARL",          # diário (lower bound)
+    "selic_monthly_proxy": "IRSTCB01BRM156N",  # mensal (proxy Selic)
+    "brlusd_daily": "DEXBZUS",              # diário (BRL por USD)
+}
+
+
+def fetch_fred(series_id: str, start: str = START_DATE, end: str = END_DATE) -> pd.Series:
+    s = pdr.DataReader(series_id, "fred", start, end)
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna().rename(series_id)
+    if s.empty:
+        raise RuntimeError(f"Série vazia no FRED: {series_id}")
+    return s
+
+
+def to_monthly_last(s: pd.Series) -> pd.Series:
+    m = s.resample("M").last().dropna()
+    m.index = m.index.to_period("M").to_timestamp("M")
+    return m
+
+
+def build_fed_lower_monthly(start: str = START_DATE, end: str = END_DATE) -> pd.Series:
+    lower_d = fetch_fred(FRED_SERIES["fed_lower_daily"], start, end)
+    lower_m = to_monthly_last(lower_d)
+    lower_m.name = "fed_lower"
+    return lower_m
+
+
+def build_brlusd_monthly(start: str = START_DATE, end: str = END_DATE) -> pd.Series:
+    fx_d = fetch_fred(FRED_SERIES["brlusd_daily"], start, end)
+    fx_m = to_monthly_last(fx_d)
+    fx_m.name = "brl_usd"
+    return fx_m
+
+
+def build_selic_proxy_monthly(start: str = START_DATE, end: str = END_DATE) -> pd.Series:
+    selic_m = fetch_fred(FRED_SERIES["selic_monthly_proxy"], start, end)
+    selic_m = selic_m.resample("M").last().dropna()
+    selic_m.index = selic_m.index.to_period("M").to_timestamp("M")
+    selic_m.name = "selic_proxy"
+    return selic_m
+
+
+def prepare_monthly_panel(start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame:
+    fed_lower = build_fed_lower_monthly(start, end)
+    fx_m = build_brlusd_monthly(start, end)
+    selic_m = build_selic_proxy_monthly(start, end)
+
+    idx = pd.date_range(pd.to_datetime(start), pd.to_datetime(end), freq="M")
+    df = pd.DataFrame(index=idx)
+    df["selic_proxy"] = selic_m.reindex(idx).ffill()
+    df["fed_lower"] = fed_lower.reindex(idx).ffill()
+    df["brl_usd"] = fx_m.reindex(idx).ffill()
+    df = df.dropna()
+    df["spread_pp"] = df["selic_proxy"] - df["fed_lower"]
+    return df
+
+
+def compute_correlations(df: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    out.append({
+        "janela": "Desde o início",
+        "n_obs": int(len(df)),
+        "correlacao": round(float(df["spread_pp"].corr(df["brl_usd"]) if len(df) > 2 else float("nan")), 4),
+    })
+    for label, months in [("12m", 12), ("24m", 24)]:
+        sliced = df.tail(months)
+        corr = sliced["spread_pp"].corr(sliced["brl_usd"]) if len(sliced) > 2 else float("nan")
+        out.append({
+            "janela": label,
+            "n_obs": int(len(sliced)),
+            "correlacao": round(float(corr), 4) if pd.notna(corr) else float("nan"),
+        })
+    return pd.DataFrame(out)
+
+
+def plot_series(df: pd.DataFrame, save_path: str | None = None, title_suffix: str = "— mensal") -> None:
+    plt.rcParams.update({
+        "axes.titlesize": 14,
+        "axes.labelsize": 12,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    fig = plt.figure(figsize=(13, 6.5))
+    ax1 = fig.add_subplot(111)
+
+    line_fx, = ax1.plot(df.index, df["brl_usd"], linewidth=2.0, label="BRL/USD (mensal)", color="#1f77b4")
+    ax1.set_ylabel("BRL/USD")
+    ax1.set_xlabel("Data (mensal)")
+    ax1.grid(True, axis="both", alpha=0.18, linestyle="-")
+
+    ax2 = ax1.twinx()
+    line_spread, = ax2.plot(df.index, df["spread_pp"], linewidth=2.0, label="Spread (Selic proxy − Fed lower)", color="#d62728")
+    ax2.set_ylabel("Spread (p.p., anual)")
+
+    ax1.tick_params(axis='y', colors=line_fx.get_color())
+    ax1.yaxis.label.set_color(line_fx.get_color())
+    ax2.tick_params(axis='y', colors=line_spread.get_color())
+    ax2.yaxis.label.set_color(line_spread.get_color())
+
+    fig.suptitle(f"Diferencial de juros (Selic proxy − Fed lower) vs câmbio BRL/USD {title_suffix}", y=0.97)
+    fig.text(0.01, -0.02, "Fonte: FRED (DFEDTARL, IRSTCB01BRM156N, DEXBZUS) / Elaboração Santa Fé Investimentos", fontsize=9, alpha=0.8)
+
+    lines = [line_fx, line_spread]
+    labels = [l.get_label() for l in lines]
+    leg = ax1.legend(lines, labels, loc="upper left", frameon=True)
+    leg.get_frame().set_alpha(0.9)
+
+    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+
+    if save_path:
+        fig.savefig(save_path, dpi=220)
+    plt.show()
+
+
+def main():
+    df = prepare_monthly_panel(START_DATE, END_DATE)
+    corr_df = compute_correlations(df)
+    print(corr_df.to_string(index=False))
+    plot_series(df, save_path="juros_vs_cambio_mensal.png")
+    df.to_csv("painel_juros_cambio_mensal.csv")
+    corr_df.to_csv("correlacoes_mensal.csv", index=False)
+
+
+if __name__ == "__main__":
+    main()
