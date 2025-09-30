@@ -1,0 +1,142 @@
+# FX 2024 (ano cheio) vs 2025 YTD — barras comparativas por moeda
+# Requisitos: pandas, matplotlib, yfinance
+# Observação: este script baixa dados da internet (Yahoo Finance). Execute em ambiente com acesso à rede.
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+from datetime import date, datetime
+
+# ===== CONFIG =====
+CUR_MAP = {
+    # nome visível                       # ticker Yahoo        # inverter para obter (moeda_local por USD)?
+    "China (CNY)":     {"ticker": "CNY=X", "invert": False},
+    "Brasil (BRL)":    {"ticker": "BRL=X", "invert": False},
+    "Chile (CLP)":     {"ticker": "CLP=X", "invert": False},
+    "Colômbia (COP)":  {"ticker": "COP=X", "invert": False},
+    "Índia (INR)":     {"ticker": "INR=X", "invert": False},
+    "México (MXN)":    {"ticker": "MXN=X", "invert": False},
+    "Coreia do Sul (KRW)": {"ticker": "KRW=X", "invert": False},
+    # Para EUR e GBP, o par comum é EURUSD=X / GBPUSD=X (USD por moeda local). Precisamos inverter.
+    "Euro (EUR)":      {"ticker": "EURUSD=X", "invert": True},
+    "Libra (GBP)":     {"ticker": "GBPUSD=X", "invert": True},
+}
+
+FONTE_TXT = "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos"
+BASELINE_WINDOW_DAYS = 3    # mediana dos 3 primeiros dias úteis do período
+
+# Períodos
+PERIODO_2024_INI = datetime(2024, 1, 1)
+PERIODO_2024_FIM = datetime(2024, 12, 31)
+PERIODO_2025_INI = datetime(2025, 1, 1)
+PERIODO_2025_FIM = datetime.combine(date.today(), datetime.min.time())  # até hoje
+
+# ===== HELPERS =====
+
+def _to_series(x):
+    if x is None:
+        return pd.Series(dtype=float)
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] == 1:
+            x = x.squeeze("columns")
+        else:
+            x = x.iloc[:, 0]
+    return x
+
+
+def safe_adj_close(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if "Adj Close" in df:
+        s = df["Adj Close"]
+    elif "Close" in df:
+        s = df["Close"]
+    else:
+        s = df.iloc[:, -1]
+    return _to_series(s)
+
+
+def normalize_local_vs_usd_robust(local_per_usd: pd.Series, win: int) -> pd.Series:
+    """Recebe uma série (moeda_local por USD). Performance = (base / s) - 1, onde base é a mediana dos 'win' primeiros dias úteis."""
+    s = _to_series(local_per_usd).dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    base = s.head(win).median()
+    return (base / s) - 1.0
+
+
+def perf_periodo(ticker: str, invert: bool, dt_ini: datetime, dt_fim: datetime, win: int) -> float:
+    """Retorna a performance acumulada no período (em %) usando a normalização robusta.
+    Ajusta o 'end' do yfinance (exclusivo) adicionando 1 dia.
+    """
+    # yfinance usa end exclusivo; somar 1 dia
+    end_exclusive = dt_fim + pd.Timedelta(days=1)
+    df = yf.download(ticker, start=dt_ini, end=end_exclusive, progress=False)
+    px = safe_adj_close(df)
+    if invert:
+        px = 1.0 / px.replace(0, pd.NA)
+    ser = normalize_local_vs_usd_robust(px, win)
+    if ser.empty:
+        return np.nan
+    return float(ser.iloc[-1] * 100.0)
+
+
+# ===== COLETA E CÁLCULO =====
+res = []
+for nome, cfg in CUR_MAP.items():
+    tkr, inv = cfg["ticker"], cfg.get("invert", False)
+    p24 = perf_periodo(tkr, inv, PERIODO_2024_INI, PERIODO_2024_FIM, BASELINE_WINDOW_DAYS)
+    p25 = perf_periodo(tkr, inv, PERIODO_2025_INI, PERIODO_2025_FIM, BASELINE_WINDOW_DAYS)
+    res.append({"Moeda": nome, "2024": p24, "2025 YTD": p25})
+
+perf_df = pd.DataFrame(res).set_index("Moeda")
+# ordenar por 2025 YTD (desc) para leitura mais fácil
+if ("2025 YTD" in perf_df.columns) and perf_df["2025 YTD"].notna().any():
+    perf_df = perf_df.sort_values(by="2025 YTD", ascending=False)
+
+# ===== GRÁFICO DE BARRAS (agrupado) =====
+fig, ax = plt.subplots(figsize=(12, 6))
+idx = np.arange(len(perf_df))
+bar_w = 0.38
+
+ax.bar(idx - bar_w/2, perf_df["2024"], width=bar_w, label="2024", zorder=2)
+ax.bar(idx + bar_w/2, perf_df["2025 YTD"], width=bar_w, label="2025 YTD", zorder=2)
+
+ax.set_title(f"Performance Cambial — 2024 (ano cheio) vs 2025 YTD — {date.today().isoformat()}")
+ax.set_ylabel("Performance (%)")
+ax.set_xticks(idx)
+ax.set_xticklabels(perf_df.index, rotation=30, ha="right")
+ax.grid(axis="y", alpha=0.3, zorder=1)
+
+# linhas horizontais das médias (não ponderadas)
+media24 = np.nanmean(perf_df["2024"].values)
+media25 = np.nanmean(perf_df["2025 YTD"].values)
+ax.axhline(media24, linestyle="--", linewidth=1.5, color="gray", label="Média 2024")
+ax.axhline(media25, linestyle="--", linewidth=1.5, color="red", label="Média 2025")
+
+# rótulos das médias ancorados à direita do eixo
+ax.text(0.995, media24, f"Média 2024: {media24:.2f}%", ha="right", va="bottom",
+        fontsize=9, color="gray", transform=ax.get_yaxis_transform())
+ax.text(0.995, media25, f"Média 2025: {media25:.2f}%", ha="right", va="bottom",
+        fontsize=9, color="red", transform=ax.get_yaxis_transform())
+
+ax.legend()
+
+# rótulos nas barras
+for i, v in enumerate(perf_df["2024"].values):
+    if not np.isnan(v):
+        ax.annotate(f"{v:.2f}%", xy=(i - bar_w/2, v), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8)
+for i, v in enumerate(perf_df["2025 YTD"].values):
+    if not np.isnan(v):
+        ax.annotate(f"{v:.2f}%", xy=(i + bar_w/2, v), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8)
+
+plt.figtext(0.01, -0.02, FONTE_TXT + " | Base: mediana dos 3 primeiros pregões de cada período", fontsize=9, ha="left")
+plt.tight_layout()
+
+out_png = f"fx_perf_2024_vs_2025ytd_{date.today().isoformat()}.png"
+plt.savefig(out_png, dpi=150, bbox_inches="tight")
+plt.show()
+
+print("Tabela (em %):\n", perf_df.round(2))
+print(f"\nGráfico salvo em: {out_png}")
