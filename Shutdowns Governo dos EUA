@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+Shutdowns dos EUA x desempenho de ativos (S&P 500, Ibovespa, USD/BRL)
+
+Retornos medidos em % para:
+ • Shutdown (D0): 1º pregão ≥ data de início vs. fechamento do pregão anterior
+ • Reabertura (D+1): 1º pregão após (reopen + 1 dia) vs. dia anterior
+ • +6m: do fechamento do dia da reabertura até ~6 meses depois (ajustado ao 1º pregão)
+
+Saídas:
+ • Tabela no console + CSV: shutdowns_retornos.csv
+ • Gráficos separados: shutdowns_SPX.png, shutdowns_IBOV.png, shutdowns_USDBRL.png
+ • Rodapé em todos os gráficos: "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos"
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+# ---------- Aparência ----------
+plt.rcParams.update({
+    "figure.figsize": (12, 6),
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
+# ---------- 1) Eventos e ativos ----------
+events = {
+    "2013 (Obama)": {"start": "2013-10-01", "reopen": "2013-10-17"},
+    "2018 Jan (Trump)": {"start": "2018-01-22", "reopen": "2018-01-22"},
+    "2018/19 (Trump)": {"start": "2018-12-24", "reopen": "2019-01-25"},
+}
+
+tickers = {
+    "S&P 500": "^GSPC",
+    "Ibovespa": "^BVSP",
+    "USD/BRL": "BRL=X",  # ↑ = dólar sobe / real mais fraco
+}
+
+# Se quiser interpretar como BRL (apreciação positiva), mude para True
+invert_brl = False
+
+# ---------- 2) Helpers ----------
+def next_trading_day(idx, date):
+    date = pd.to_datetime(date)
+    pos = idx.searchsorted(date)
+    return idx[pos] if pos < len(idx) else None
+
+def prev_trading_day(idx, date):
+    date = pd.to_datetime(date)
+    pos = idx.searchsorted(date) - 1
+    return idx[pos] if pos >= 0 else None
+
+def pct(a, b):
+    return (a / b - 1.0) * 100.0
+
+# ---------- 3) Download dos preços ----------
+data_start = "2013-01-01"
+data_end   = "2019-08-31"
+
+panel = {}
+for name, ticker in tickers.items():
+    df = yf.download(ticker, start=data_start, end=data_end,
+                     progress=False, auto_adjust=False)
+    if "Adj Close" in df.columns:
+        s = df[["Adj Close"]].copy()
+    elif "Close" in df.columns:
+        s = df[["Close"]].copy()
+    else:
+        raise ValueError(f"Nem 'Adj Close' nem 'Close' disponíveis para {ticker}")
+    s.columns = ["close"]
+    s = s.dropna()
+    panel[name] = s
+
+# ---------- 4) Cálculos ----------
+rows = []
+for ev_name, ev in events.items():
+    start  = pd.to_datetime(ev["start"])
+    reopen = pd.to_datetime(ev["reopen"])
+    plus6  = reopen + pd.DateOffset(months=6)
+
+    for asset, df in panel.items():
+        idx = df.index
+
+        # D0 (dia do shutdown)
+        d0 = next_trading_day(idx, start)
+        d0_prev = prev_trading_day(idx, d0)
+        r_d0 = pct(df.loc[d0, "close"], df.loc[d0_prev, "close"]) if d0_prev is not None else np.nan
+
+        # D+1 (dia útil seguinte à reabertura)
+        d1 = next_trading_day(idx, reopen + pd.Timedelta(days=1))
+        d1_prev = prev_trading_day(idx, d1)
+        r_d1 = pct(df.loc[d1, "close"], df.loc[d1_prev, "close"]) if d1_prev is not None else np.nan
+
+        # +6m (acumulado desde o fechamento do dia da reabertura)
+        base = next_trading_day(idx, reopen)
+        t6 = next_trading_day(idx, plus6)
+        r_6m = pct(df.loc[t6, "close"], df.loc[base, "close"]) if (base is not None and t6 is not None) else np.nan
+
+        rows.append({
+            "Ativo": asset, "Evento": ev_name,
+            "Dia do shutdown": r_d0,
+            "Dia seguinte (reabertura)": r_d1,
+            "+6m após reabrir": r_6m
+        })
+
+results = pd.DataFrame(rows).set_index(["Ativo", "Evento"]).round(2)
+
+# Inverter leitura do FX (opcional)
+fx_index_key = "USD/BRL"                      # chave real no índice da tabela
+fx_title = "USD/BRL (↑ = real mais fraco)"    # texto para o título
+if invert_brl:
+    results.loc[(fx_index_key, slice(None)), :] *= -1
+    results = results.rename(index={"USD/BRL": "BRL (↑ = real mais forte)"})
+    fx_index_key = "BRL (↑ = real mais forte)"
+    fx_title = "BRL (↑ = real mais forte)"
+
+# ---------- 5) Tabela + CSV ----------
+print("\n=== Retornos (%) ===\n")
+print(results)
+results.to_csv("shutdowns_retornos.csv", encoding="utf-8")
+
+# ---------- 6) Função para gráfico separado ----------
+def plot_single_asset(results_table, asset_key, plot_title, output_png):
+    sub = results_table.loc[asset_key]  # index=Evento, columns=Horizontes
+    dfp = sub.reset_index().melt(id_vars="Evento", var_name="Horizonte", value_name="Retorno (%)")
+    pv = dfp.pivot_table(index="Horizonte", columns="Evento", values="Retorno (%)")
+    # Ordena e renomeia categorias
+    pv = pv.reindex(["Dia do shutdown", "Dia seguinte (reabertura)", "+6m após reabrir"])
+    pv.index = ["Shutdown (D0)", "Reabertura (D+1)", "+6m"]
+
+    ax = pv.plot(kind="bar")
+    ax.set_ylabel("Retorno (%)")
+    ax.set_xlabel("")
+    title_dates = " | ".join([f"{k}: {v['start']}→{v['reopen']}" for k, v in events.items()])
+    ax.set_title(
+        f"Shutdowns dos EUA: {plot_title}\n"
+        f"Datas: {title_dates}\n"
+        "Metodologia: retornos em % (fechamento); D0 = 1º pregão ≥ início; "
+        "D+1 = 1º pregão após reabertura; +6m = desde a reabertura."
+    )
+
+    ax.yaxis.set_major_formatter(PercentFormatter(decimals=1))
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.axhline(0, linewidth=1)
+
+    for cont in ax.containers:
+        ax.bar_label(cont, fmt="%.1f%%", padding=2)
+
+    fig = ax.get_figure()
+    fig.text(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+             ha="left", va="bottom", fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=200, bbox_inches="tight")
+    plt.show()
+
+# ---------- 7) Gera os 3 gráficos separados ----------
+plot_single_asset(results, "S&P 500", "S&P 500", "shutdowns_SPX.png")
+plot_single_asset(results, "Ibovespa", "Ibovespa", "shutdowns_IBOV.png")
+plot_single_asset(results, fx_index_key, fx_title, "shutdowns_USDBRL.png")
