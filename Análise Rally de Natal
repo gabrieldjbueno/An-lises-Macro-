@@ -1,0 +1,213 @@
+# S&P 500 — Rally de Natal (Nov+Dez) + Tabela/Heatmap de Retornos Mensais (coolwarm)
+# Cobertura desde 2000, preservando Jan/2000 (buffer a partir de 1999-12-01)
+# Notebook-friendly (sem argparse / sem salvar arquivos)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+from matplotlib.ticker import PercentFormatter, MaxNLocator
+
+# -------------------------------
+# Helpers
+# -------------------------------
+def _to_series(prices) -> pd.Series:
+    """Garante que 'prices' seja uma Series com índice de datas e dtype float."""
+    if isinstance(prices, pd.DataFrame):
+        s = prices.select_dtypes(include=[float, int]).squeeze()
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+    else:
+        s = prices
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index)
+    s = s.sort_index()
+    return s.astype(float)
+
+# -------------------------------
+# Loader Yahoo Finance (S&P 500)
+# -------------------------------
+def load_spx_yahoo(start="1999-12-01"):
+    """
+    Baixa ^GSPC a partir de 'start'.
+    Usamos 1999-12-01 para garantir o retorno de Jan/2000 na tabela mensal.
+    """
+    import yfinance as yf
+    df = yf.download("^GSPC", start=start, progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise ValueError("Yahoo não retornou dados para ^GSPC (S&P 500).")
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    px = df[[col]].rename(columns={col: "close"})
+    return _to_series(px["close"])
+
+# -------------------------------
+# Rally de Natal (retorno Nov+Dez)
+# -------------------------------
+def rally_natal_returns(prices) -> pd.DataFrame:
+    """
+    Retorno entre o último pregão de OUT e o último pregão de DEZ de cada ano.
+    Retorna DataFrame: year, oct_close, dec_close, rally_return_pct
+    """
+    s = _to_series(prices)
+
+    # Último preço de cada mês (alias 'ME' = month-end, substitui 'M' deprecado)
+    month_last = s.resample("ME").last().dropna()
+
+    rows = []
+    years = sorted(set(month_last.index.year))
+    for y in years:
+        oct_mask = (month_last.index.year == y) & (month_last.index.month == 10)
+        dec_mask = (month_last.index.year == y) & (month_last.index.month == 12)
+        if oct_mask.any() and dec_mask.any():
+            p0 = float(month_last.loc[oct_mask].iloc[-1])
+            p1 = float(month_last.loc[dec_mask].iloc[-1])
+            ret = (p1 / p0) - 1.0
+            rows.append({
+                "year": y,
+                "oct_close": p0,
+                "dec_close": p1,
+                "rally_return_pct": ret * 100.0
+            })
+    return pd.DataFrame(rows).sort_values("year").reset_index(drop=True)
+
+def plot_rally_bars_with_stats(df: pd.DataFrame, title_extra: str = ""):
+    """
+    Barras anuais do retorno Nov+Dez e, ao final, duas barras: Média e Mediana.
+    Barras em laranja.
+    """
+    if df.empty:
+        print("Sem anos completos (Out & Dez) para calcular.")
+        return
+
+    labels_years = df["year"].astype(str).tolist()
+    values = df["rally_return_pct"].to_numpy(dtype=float)
+
+    avg_val = float(np.nanmean(values))
+    med_val = float(np.nanmedian(values))
+
+    labels_ext = labels_years + ["Média", "Mediana"]
+    values_ext = list(values) + [avg_val, med_val]
+
+    x = np.arange(len(labels_ext))
+    width = 0.75
+
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    bars = ax.bar(x, values_ext, width, label="Retorno (Nov+Dez)", color="orange", edgecolor="black", linewidth=0.4)
+
+    ax.set_title("S&P 500 — 'Rally de Natal' (retorno de fim de out → fim de dez)" + (f"\n{title_extra}" if title_extra else ""))
+    ax.set_ylabel("Retorno (%)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_ext, rotation=45, ha="right")
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
+    ax.grid(True, axis="y", linewidth=0.5, alpha=0.35)
+
+    # Rótulos próximos às barras
+    for b in bars:
+        h = b.get_height()
+        y = h + (0.3 if h >= 0 else -0.3)
+        ax.text(b.get_x() + b.get_width()/2., y, f"{h:.1f}%",
+                ha='center', va='bottom' if h>=0 else 'top', fontsize=9, clip_on=True)
+
+    # Linha divisória antes das estatísticas
+    ax.axvline(len(labels_years) - 0.5, linestyle="--", linewidth=1, alpha=0.4)
+    ax.legend(loc="upper right", frameon=False)
+
+    # Fonte
+    fig.text(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+             ha="left", va="bottom", fontsize=9, color="dimgray")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.show()
+
+# -------------------------------
+# Tabela de retornos mensais + Heatmap
+# -------------------------------
+def monthly_returns_table(prices) -> pd.DataFrame:
+    """
+    Retornos mensais (%) — linhas = anos, colunas = meses (Jan..Dez).
+    """
+    s = _to_series(prices)
+    mlast = s.resample("ME").last().dropna()
+    mret = mlast.pct_change().dropna() * 100.0
+
+    df = pd.DataFrame({
+        "year": mret.index.year,
+        "month": mret.index.month,
+        "ret_pct": mret.values
+    })
+
+    pivot = df.pivot(index="year", columns="month", values="ret_pct").sort_index()
+    month_names = {1:"Jan",2:"Fev",3:"Mar",4:"Abr",5:"Mai",6:"Jun",
+                   7:"Jul",8:"Ago",9:"Set",10:"Out",11:"Nov",12:"Dez"}
+    pivot = pivot.reindex(columns=range(1,13))
+    pivot.columns = [month_names[m] for m in pivot.columns]
+    return pivot
+
+def plot_monthly_heatmap(pivot: pd.DataFrame, title="S&P 500 — Retornos mensais (%)"):
+    """
+    Heatmap com colormap 'coolwarm' centrado em 0.
+    Mostra anos >= 2000.
+    """
+    if pivot.empty:
+        print("Tabela vazia.")
+        return
+
+    # Filtra exibição para anos >= 2000
+    pivot = pivot[pivot.index >= 2000]
+
+    data = pivot.values
+    years = pivot.index.astype(int).tolist()
+    months = pivot.columns.tolist()
+
+    # escala simétrica ao redor de 0 para realçar perdas/ganhos
+    vmax = np.nanmax(np.abs(data))
+    vmin = -vmax
+
+    fig, ax = plt.subplots(figsize=(14, max(6, len(years)*0.35)))
+    im = ax.imshow(data, aspect="auto", cmap="coolwarm", vmin=vmin, vmax=vmax)
+
+    ax.set_xticks(np.arange(len(months)))
+    ax.set_yticks(np.arange(len(years)))
+    ax.set_xticklabels(months)
+    ax.set_yticklabels(years)
+    ax.set_title(title)
+
+    # rótulos nas células
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            val = data[i, j]
+            txt = "" if np.isnan(val) else f"{val:.1f}%"
+            ax.text(j, i, txt, ha="center", va="center", fontsize=8)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+
+    # grade suave
+    ax.set_xticks(np.arange(-.5, len(months), 1), minor=True)
+    ax.set_yticks(np.arange(-.5, len(years), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.5)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    # fonte
+    fig.text(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+             ha="left", va="bottom", fontsize=9, color="dimgray")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.show()
+
+# -------------------------------
+# Execução (1º barras, depois tabela/heatmap)
+# -------------------------------
+px = load_spx_yahoo(start="1999-12-01")
+
+# 1) Rally de Natal (Nov+Dez)
+df_rally = rally_natal_returns(px)
+display(df_rally)
+plot_rally_bars_with_stats(df_rally)   # barras em laranja
+
+# 2) Tabela & Heatmap — anos >= 2000
+pivot_months = monthly_returns_table(px)
+pivot_months = pivot_months[pivot_months.index >= 2000]
+display(pivot_months)
+plot_monthly_heatmap(pivot_months)     # coolwarm centrado em 0
