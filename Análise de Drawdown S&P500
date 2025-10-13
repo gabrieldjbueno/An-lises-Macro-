@@ -1,0 +1,310 @@
+# --------------------------------------------
+# S&P 500 — Quedas ≥5% em até 5 pregões (desde 2000-01-01)
+# Notebook-friendly (sem argparse / sem salvar arquivos)
+# --------------------------------------------
+import math
+from typing import List, Dict
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+import matplotlib.dates as mdates
+from matplotlib.ticker import PercentFormatter, MaxNLocator
+
+# -----------------------------
+# Carregamento via Yahoo Finance
+# -----------------------------
+def load_from_yfinance(ticker: str = "^GSPC", start: str = "2000-01-01") -> pd.Series:
+    import yfinance as yf
+    df = yf.download(ticker, start=start, progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise ValueError(f"Nenhum dado retornado para {ticker}. Verifique conexão e ticker.")
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    s = df[col].dropna().astype(float)
+    s.index = pd.to_datetime(s.index)
+    return s
+
+# -----------------------------
+# Detecção de eventos
+# -----------------------------
+def detect_drawdown_events(
+    prices: pd.Series,
+    min_drop: float = -0.05,
+    window_days: int = 5,
+) -> List[Dict]:
+    """
+    Evento: a partir de D0, em ATÉ 'window_days' pregões o retorno acumulado <= min_drop (ex.: -5%).
+    Fundo = menor retorno relativo em [D0, D0+window_days-1].
+    post5d_perf = retorno de (fundo+1) até (fundo+5).
+    Recuperação = 1º dia com preço >= preço de D0. Dias contam de D0 até esse dia.
+    Não sobrepõe eventos: após um evento, pula para o dia seguinte à recuperação,
+    ou para (fundo+window_days) se não recuperar.
+    """
+    prices = prices.dropna()
+    prices = prices[~prices.index.duplicated(keep="first")]
+    dates = prices.index
+    i = 0
+    events = []
+
+    while i < len(dates):
+        start_idx = i
+        start_date = dates[start_idx]
+        start_price = float(prices.iloc[start_idx])
+
+        end_idx = min(start_idx + window_days - 1, len(dates) - 1)
+        window_prices = prices.iloc[start_idx:end_idx + 1]
+        rel = (window_prices / start_price) - 1.0
+        trough_rel = float(rel.min())
+        trough_offset = int(rel.values.argmin())
+        trough_idx = start_idx + trough_offset
+        trough_date = dates[trough_idx]
+        trough_price = float(prices.iloc[trough_idx])
+
+        if trough_rel <= min_drop:
+            # performance dos 5 pregões APÓS o fundo
+            post_start_idx = min(trough_idx + 1, len(dates) - 1)
+            post_end_idx = min(post_start_idx + 5, len(dates) - 1)
+            if post_end_idx > post_start_idx:
+                post5d_perf = (prices.iloc[post_end_idx] / prices.iloc[post_start_idx]) - 1.0
+                post5d_perf = float(post5d_perf)
+            else:
+                post5d_perf = float("nan")
+
+            # recuperação: 1º dia com preço >= preço de D0
+            recover_idx = None
+            for j in range(trough_idx, len(dates)):
+                if float(prices.iloc[j]) >= start_price:
+                    recover_idx = j
+                    break
+            if recover_idx is not None:
+                recover_date = dates[recover_idx]
+                days_to_recover = recover_idx - start_idx
+            else:
+                recover_date = pd.NaT
+                days_to_recover = float("nan")
+
+            events.append({
+                "start_date": start_date,
+                "start_price": start_price,
+                "trough_date": trough_date,
+                "trough_price": trough_price,
+                "drawdown_total_pct": trough_rel * 100.0,
+                "post5d_perf_pct": post5d_perf * 100.0 if not math.isnan(post5d_perf) else float("nan"),
+                "recover_date": recover_date,
+                "days_to_recover": int(days_to_recover) if not math.isnan(days_to_recover) else float("nan"),
+            })
+
+            # pular adiante (sem sobrepor eventos)
+            if recover_idx is not None:
+                i = recover_idx + 1
+            else:
+                i = trough_idx + window_days
+        else:
+            i += 1
+
+    return events
+
+def events_to_dataframe(events: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(events)
+    if df.empty:
+        return df
+    df = df.sort_values("start_date").reset_index(drop=True)
+    for c in ["start_date", "trough_date", "recover_date"]:
+        df[c] = pd.to_datetime(df[c])
+    df["start_date_str"] = df["start_date"].dt.strftime("%Y-%m-%d")
+    df["trough_date_str"] = df["trough_date"].dt.strftime("%Y-%m-%d")
+    df["recover_date_str"] = df["recover_date"].dt.strftime("%Y-%m-%d").where(df["recover_date"].notna(), "")
+    return df
+
+# -----------------------------
+# Gráfico de linha (com marcadores vermelho/verde)
+# -----------------------------
+def plot_price_with_markers_pretty(prices: pd.Series, events_df: pd.DataFrame, titulo_extra: str = ""):
+    plt.close('all')
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+
+    # linha principal
+    line, = ax.plot(prices.index, prices.values, linewidth=1.6)
+
+    # marcadores — vermelho (início) e verde (recuperação)
+    for _, row in events_df.iterrows():
+        sd = pd.Timestamp(row["start_date"])
+        if sd in prices.index:
+            ax.scatter(sd, prices.loc[sd], s=28, marker="o", color="red", zorder=3, label="_nolegend_")
+    for _, row in events_df.iterrows():
+        rd = row["recover_date"]
+        if pd.notna(rd):
+            rd = pd.Timestamp(rd)
+            if rd in prices.index:
+                ax.scatter(rd, prices.loc[rd], s=28, marker="o", color="green", zorder=3, label="_nolegend_")
+
+    # grade, labels e título
+    ax.grid(True, linewidth=0.5, alpha=0.35)
+    ax.set_xlabel("Data")
+    ax.set_ylabel("Fechamento")
+    ax.set_title("S&P 500 — Quedas ≥5% em até 5 pregões" + (f"\n{titulo_extra}" if titulo_extra else ""))
+
+    # datas legíveis
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=12)
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+
+    # legenda coerente
+    from matplotlib.lines import Line2D
+    line_handle  = Line2D([0], [0], color=line.get_color(), lw=1.6, label="S&P 500 (fechamento)")
+    red_dot      = Line2D([0], [0], marker='o', linestyle='', color='red',   label='Início da correção', markersize=6)
+    green_dot    = Line2D([0], [0], marker='o', linestyle='', color='green', label='Recuperação',         markersize=6)
+    ax.legend(handles=[line_handle, red_dot, green_dot], frameon=False, loc="upper left")
+
+    # Label de fonte
+    fig.text(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+             ha="left", va="bottom", fontsize=9, color="dimgray")
+
+    plt.tight_layout()
+    plt.show()
+
+# -----------------------------
+# Barras com eixo Y duplo + médias dentro do mesmo gráfico
+# -----------------------------
+def plot_bars_events_dual_with_means(events_df: pd.DataFrame):
+    """
+    Barras com eixo duplo:
+      - Esquerda (INVERTIDO): Drawdown total (%) em laranja
+      - Direita            : Dias até recuperar
+    Inclui duas barras extras ao final: "Média (%)" e "Média (dias)".
+    Ajustes:
+      - Rótulos do drawdown bem próximos às barras
+      - Rótulos das médias ainda mais próximos
+      - Legenda no canto superior direito
+    """
+    if events_df.empty:
+        print("Nenhum evento encontrado.")
+        return
+
+    import numpy as np
+    from matplotlib.ticker import PercentFormatter, MaxNLocator
+
+    # Dados por evento
+    labels = events_df["start_date_str"].tolist()
+    drawdowns = events_df["drawdown_total_pct"].to_numpy(dtype=float)   # %
+    days_rec  = events_df["days_to_recover"].to_numpy(dtype=float)      # dias
+
+    # Médias (ignorando NaN)
+    avg_draw  = float(np.nanmean(drawdowns)) if drawdowns.size else np.nan
+    avg_days  = float(np.nanmean(days_rec))  if days_rec.size  else np.nan
+
+    # Acrescenta as médias no final (uma por eixo)
+    labels_ext    = labels + ["Média (%)", "Média (dias)"]
+    drawdowns_ext = list(drawdowns) + [avg_draw, np.nan]  # média (%) só no eixo esquerdo
+    days_rec_ext  = list(days_rec)  + [np.nan,  avg_days] # média (dias) só no eixo direito
+
+    x = np.arange(len(labels_ext))
+    width = 0.42
+
+    fig, ax1 = plt.subplots(figsize=(13, 6.5))
+
+    # Barras do eixo esquerdo (drawdown %) em laranja
+    bars1 = ax1.bar(x - width/2, drawdowns_ext, width, label="Drawdown total (%)",
+                    color="orange", edgecolor="black", linewidth=0.4)
+
+    ax1.set_ylabel("Drawdown (%)")
+    ax1.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    ax1.yaxis.set_major_locator(MaxNLocator(nbins=6))
+
+    # Inverte o eixo: 0% no topo, negativos para baixo
+    dd_valid = np.array([v for v in drawdowns_ext if not np.isnan(v)])
+    if dd_valid.size:
+        ymin = dd_valid.min()                 # ex.: -9.6
+        margin = max(0.6, 0.05 * abs(ymin))   # margem pequena
+        ax1.set_ylim(0, ymin - margin)        # eixo invertido
+    else:
+        ax1.set_ylim(0, -10)
+
+    # Barras do eixo direito (dias)
+    ax2 = ax1.twinx()
+    bars2 = ax2.bar(x + width/2, days_rec_ext, width, label="Dias até recuperar",
+                    edgecolor="black", linewidth=0.4)
+    ax2.set_ylabel("Dias até recuperar")
+    ax2.yaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
+
+    # X ticks
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels_ext, rotation=45, ha="right")
+
+    # Título + grid
+    ax1.set_title("Eventos — Drawdown total (%) vs Dias para recuperar (com médias)")
+    ax1.grid(True, axis="y", linewidth=0.5, alpha=0.35)
+
+    # --- Rótulos de dados (ajustados) ---
+    # Offsets pequenos para ficar bem colado nas barras
+    offset_pct_default = 0.30   # em pontos percentuais
+    offset_pct_mean    = 0.20   # ainda mais perto nas médias
+    offset_days        = 0.3    # poucos "dias" acima
+
+    n_labels = len(labels)  # índice de início das barras de média
+
+    def autolabel_percent(ax, bars):
+        for i, b in enumerate(bars):
+            h = b.get_height()
+            if np.isnan(h):
+                continue
+            # No eixo invertido, "acima" do topo da barra (na direção de 0) é h + offset positivo
+            off = offset_pct_mean if i >= n_labels else offset_pct_default
+            y = h + off
+            ax.text(b.get_x() + b.get_width()/2., y, f"{h:.1f}%",
+                    ha='center', va='bottom', fontsize=9, clip_on=True)
+
+    def autolabel_int(ax, bars):
+        for b in bars:
+            h = b.get_height()
+            if np.isnan(h):
+                continue
+            y = h + offset_days
+            ax.text(b.get_x() + b.get_width()/2., y, f"{int(round(h))}",
+                    ha='center', va='bottom', fontsize=9, clip_on=True)
+
+    autolabel_percent(ax1, bars1)
+    autolabel_int(ax2, bars2)
+
+    # Legenda combinada (canto superior direito)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, frameon=False, loc="upper right")
+
+    # Label de fonte
+    fig.text(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+             ha="left", va="bottom", fontsize=9, color="dimgray")
+
+    plt.tight_layout()
+    plt.show()
+
+# -----------------------------
+# Pipeline
+# -----------------------------
+def run_analysis(ticker="^GSPC", start="2000-01-01", window_days=5, threshold_pct=-5.0):
+    prices = load_from_yfinance(ticker=ticker, start=start)
+    events = detect_drawdown_events(
+        prices=prices,
+        min_drop=threshold_pct/100.0,
+        window_days=window_days,
+    )
+    events_df = events_to_dataframe(events)
+
+    # Tabela de conferência (primeiros 20 eventos)
+    if not events_df.empty:
+        display(events_df[[
+            "start_date","trough_date","recover_date",
+            "start_price","trough_price",
+            "drawdown_total_pct","post5d_perf_pct","days_to_recover"
+        ]].head(20))
+    else:
+        print("Nenhum evento detectado com os parâmetros atuais.")
+
+    # Gráficos
+    plot_price_with_markers_pretty(prices, events_df)
+    plot_bars_events_dual_with_means(events_df)
+
+# ===== EXECUÇÃO =====
+# Ajuste o ticker para "SPY" se preferir usar o ETF.
+run_analysis(ticker="^GSPC", start="2000-01-01", window_days=5, threshold_pct=-5.0)
