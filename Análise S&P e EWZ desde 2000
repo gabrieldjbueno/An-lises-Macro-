@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+# EWZ (verde) vs S&P 500 (azul) — retornos anuais desde 2000
+# 1) Barras: retornos anuais + linhas tracejadas das médias
+# 2) Scatter: média x desvio (tamanho ∝ volatilidade)
+# 3) Barras 1 eixo: % anos positivos vs % anos negativos
+# Requisitos: pip install yfinance pandas matplotlib
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+from datetime import datetime
+import matplotlib.patheffects as pe
+
+START_YEAR = 2000
+END_YEAR = datetime.today().year - 1  # último ano completo
+
+# cores: S&P azul, EWZ verde
+COLORS = {"S&P500": "#1f77b4", "EWZ": "#2ca02c"}  # azul, verde
+
+def get_annual_returns_series(ticker: str, start_year: int) -> pd.Series:
+    df = yf.download(ticker, start=f"{start_year}-01-01", progress=False, auto_adjust=True)
+    close = df["Close"].dropna()
+    annual = close.resample("YE").last().pct_change()
+    if isinstance(annual, pd.DataFrame):
+        annual = annual.iloc[:, 0]
+    annual.index = annual.index.year
+    return annual
+
+# Séries (EWZ e S&P 500)
+ewz = get_annual_returns_series("EWZ", START_YEAR); ewz.name = "EWZ"
+spx = get_annual_returns_series("^GSPC", START_YEAR); spx.name = "S&P500"
+
+# Tabela consolidada
+ret_ann = pd.concat([ewz, spx], axis=1).dropna()
+ret_ann = ret_ann.loc[(ret_ann.index >= START_YEAR) & (ret_ann.index <= END_YEAR)]
+
+# Estatísticas
+stats = {}
+for col in ["EWZ", "S&P500"]:
+    s = ret_ann[col]
+    stats[col] = {
+        "media": s.mean(),
+        "desvio": s.std(),
+        "pct_pos": (s > 0).mean(),
+        "pct_neg": (s < 0).mean(),
+        "best_year": s.idxmax(), "best_ret": s.max(),
+        "worst_year": s.idxmin(), "worst_ret": s.min(),
+        "n": len(s),
+    }
+stats_df = pd.DataFrame(stats).T
+
+# =========================================================
+# 1) BARRAS — Retornos anuais + médias tracejadas
+# =========================================================
+plt.figure(figsize=(14, 6))
+ax = plt.gca()
+
+years = ret_ann.index.astype(int)
+x = np.arange(len(years))
+width = 0.42
+
+bars_ewz = ax.bar(x - width/2, ret_ann["EWZ"],    width=width, color=COLORS["EWZ"],    alpha=0.9, label="EWZ")
+bars_spx = ax.bar(x + width/2, ret_ann["S&P500"], width=width, color=COLORS["S&P500"], alpha=0.9, label="S&P 500")
+
+ax.axhline(stats["EWZ"]["media"],    linestyle="--", linewidth=1.8, color=COLORS["EWZ"],    alpha=0.95,
+           label=f"Média EWZ: {stats['EWZ']['media']:.2%}")
+ax.axhline(stats["S&P500"]["media"], linestyle="--", linewidth=1.8, color=COLORS["S&P500"], alpha=0.95,
+           label=f"Média S&P 500: {stats['S&P500']['media']:.2%}")
+
+ax.set_xticks(x); ax.set_xticklabels(years, fontsize=9)
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+ax.set_ylabel("Retorno anual", fontsize=11)
+ax.set_title(f"Retornos Anuais — EWZ (verde) vs S&P 500 (azul) — {years.min()}–{years.max()}", fontsize=13)
+ax.grid(axis="y", linestyle=":", alpha=0.4)
+ax.legend(loc="upper right", ncol=2, frameon=False)
+
+def add_labels(bars):
+    for b in bars:
+        h = b.get_height()
+        ax.annotate(f"{h:,.0%}", xy=(b.get_x() + b.get_width()/2, h),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=8)
+add_labels(bars_ewz); add_labels(bars_spx)
+
+plt.figtext(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos", ha="left", fontsize=9)
+plt.tight_layout(); plt.show()
+
+# =========================================================
+# 2) SCATTER — Média x Desvio (tamanho ∝ volatilidade)
+# =========================================================
+plt.figure(figsize=(7.5, 6))
+ax = plt.gca()
+
+vol = stats_df["desvio"]
+size = (1500 * (vol / vol.max())).clip(lower=400)
+
+for idx in stats_df.index:
+    x_ = stats_df.loc[idx, "desvio"]
+    y_ = stats_df.loc[idx, "media"]
+    ax.scatter(x_, y_, s=size.loc[idx], alpha=0.85, color=COLORS[idx],
+               edgecolor="black", linewidth=0.6, zorder=3)
+    ax.text(x_, y_, idx, ha="center", va="center", fontsize=12, fontweight="bold",
+            color="white", path_effects=[pe.withStroke(linewidth=2.2, foreground="black")], zorder=4)
+
+ax.set_xlabel("Desvio-padrão anual"); ax.set_ylabel("Média anual")
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+ax.xaxis.set_major_formatter(PercentFormatter(1.0))
+ax.set_xlim(0, 0.50); ax.set_ylim(0, 0.20)     # limites solicitados
+ax.set_xticks(np.arange(0, 0.55, 0.05)); ax.set_yticks(np.arange(0, 0.21, 0.02))
+ax.grid(True, linestyle=":", alpha=0.4)
+ax.set_title("Média x Volatilidade — EWZ (verde) vs S&P 500 (azul)")
+
+plt.figtext(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos", ha="left", fontsize=9)
+plt.tight_layout(); plt.show()
+
+# =========================================================
+# 3) BARRAS (1 eixo) — % anos positivos vs % anos negativos
+# =========================================================
+labels = ["EWZ", "S&P500"]
+x = np.arange(len(labels))
+width = 0.38
+
+pos_vals = [stats_df.loc["EWZ","pct_pos"],  stats_df.loc["S&P500","pct_pos"]]
+neg_vals = [stats_df.loc["EWZ","pct_neg"],  stats_df.loc["S&P500","pct_neg"]]
+
+fig, ax = plt.subplots(figsize=(8.5, 6))
+
+bars_pos = ax.bar(x - width/2, pos_vals, width=width,
+                  color=[COLORS[l] for l in labels], alpha=0.95, label="% anos positivos")
+bars_neg = ax.bar(x + width/2, neg_vals, width=width,
+                  color=[COLORS[l] for l in labels], alpha=0.45, hatch="///",
+                  edgecolor="black", linewidth=0.3, label="% anos negativos")
+
+ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=11)
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+ax.set_ylim(0, 1.0)
+ax.set_ylabel("% de anos", fontsize=11)
+ax.set_title("% de anos positivos (sólido) vs % de anos negativos (hachurado)")
+
+handles = [bars_pos[0], bars_neg[0]]
+ax.legend(handles, ["% anos positivos", "% anos negativos"], loc="upper center", ncol=2, frameon=False)
+
+def label_bars(bars):
+    for b in bars:
+        h = b.get_height()
+        ax.annotate(f"{h:.0%}", xy=(b.get_x() + b.get_width()/2, h),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=10)
+
+label_bars(bars_pos); label_bars(bars_neg)
+
+ax.grid(axis="y", linestyle=":", alpha=0.4)
+plt.figtext(0.01, 0.01, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos", ha="left", fontsize=9)
+plt.tight_layout(); plt.show()
