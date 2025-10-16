@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+# Análise: Performance, Correlação e Risco — EWA, EWZ, VALE, BHP, RIO
+# Requisitos: pip install yfinance pandas numpy matplotlib
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --------------------------
+# Configurações e tickers
+# --------------------------
+start = "2000-01-01"
+tickers = {
+    "EWA": "EWA",      # iShares MSCI Australia ETF
+    "EWZ": "EWZ",      # iShares MSCI Brazil ETF
+    "VALE": "VALE",    # Vale S.A. ADR
+    "BHP": "BHP",      # BHP Group ADR
+    "RIO": "RIO",      # Rio Tinto ADR
+}
+
+# Paleta de cores (Rio marrom)
+colors = {
+    "EWA": "#0b3d91",   # Azul escuro
+    "EWZ": "#0b5f2a",   # Verde escuro
+    "VALE": "#b8860b",  # Amarelo escuro
+    "BHP": "#d62728",   # Vermelho
+    "RIO": "#8b4513",   # Marrom
+}
+
+plt.rcParams["axes.grid"] = True
+plt.rcParams["font.size"] = 11
+
+# --------------------------
+# Download de dados
+# --------------------------
+data = yf.download(list(tickers.values()), start=start, auto_adjust=True, progress=False)
+prices = data["Close"].rename(columns={v: k for k, v in tickers.items()})
+volumes = data["Volume"].rename(columns={v: k for k, v in tickers.items()})
+
+prices = prices.dropna(axis=1, how="all").ffill().dropna()
+volumes = volumes.reindex(prices.index).fillna(0)
+
+# --------------------------
+# Funções auxiliares
+# --------------------------
+def cagr(series: pd.Series) -> float:
+    series = series.dropna()
+    total_return = series.iloc[-1] / series.iloc[0]
+    years = (series.index[-1] - series.index[0]).days / 365.25
+    return total_return ** (1 / years) - 1 if years > 0 else np.nan
+
+def ann_vol(returns: pd.Series) -> float:
+    return returns.std(ddof=0) * np.sqrt(252)
+
+def max_drawdown(series: pd.Series) -> float:
+    cummax = series.cummax()
+    dd = series / cummax - 1.0
+    return dd.min()
+
+ret = prices.pct_change().dropna()
+
+# --------------------------
+# 1) Performance normalizada
+# --------------------------
+base = prices.iloc[0]
+perf = (prices / base) * 100.0
+
+fig1, ax1 = plt.subplots(figsize=(16, 8))
+for col in perf.columns:
+    ax1.plot(perf.index, perf[col], label=col, linewidth=1.8, color=colors.get(col, None))
+ax1.set_title("Performance Normalizada (Base = 100) — desde 01/01/2000")
+ax1.set_ylabel("Índice (Base=100)")
+ax1.set_xlabel("Data")
+ax1.legend(loc="upper left", ncols=3, frameon=True)
+ax1.text(0.5, -0.08, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+         ha="center", va="center", transform=ax1.transAxes, fontsize=10, style='italic')
+plt.tight_layout()
+
+# --------------------------
+# 2) Matriz de correlação
+# --------------------------
+corr = ret.corr().reindex(perf.columns, axis=0).reindex(perf.columns, axis=1)
+
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+im = ax2.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+ax2.set_xticks(range(len(corr.columns)))
+ax2.set_yticks(range(len(corr.index)))
+ax2.set_xticklabels(corr.columns)
+ax2.set_yticklabels(corr.index)
+ax2.set_title("Matriz de Correlação — Retornos Diários")
+plt.setp(ax2.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+cbar = plt.colorbar(im)
+cbar.set_label("Correlação")
+for i in range(len(corr.index)):
+    for j in range(len(corr.columns)):
+        ax2.text(j, i, f"{corr.iloc[i, j]:.2f}", va="center", ha="center", color="black", fontsize=9)
+ax2.text(0.5, -0.1, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+         ha="center", va="center", transform=ax2.transAxes, fontsize=10, style='italic')
+plt.tight_layout()
+
+# --------------------------
+# 3) Scatter — Risco x Retorno
+# --------------------------
+metrics = []
+for col in perf.columns:
+    series = prices[col].dropna()
+    r = ret[col].dropna()
+    vol_ann = ann_vol(r)
+    g = cagr(series)
+    dd = max_drawdown(series)
+    vol_avg = volumes[col].loc[series.index].mean()
+    metrics.append({"Ticker": col, "CAGR": g, "VolAnn": vol_ann, "MDD": dd, "AvgVolume": vol_avg})
+
+dfm = pd.DataFrame(metrics).set_index("Ticker")
+
+vol_min, vol_max = dfm["AvgVolume"].min(), dfm["AvgVolume"].max()
+sizes = 200 * (dfm["AvgVolume"] - vol_min) / (vol_max - vol_min) + 200 if vol_max > vol_min else pd.Series(300.0, index=dfm.index)
+
+fig3, ax3 = plt.subplots(figsize=(10, 7))
+for tk in dfm.index:
+    ax3.scatter(
+        dfm.loc[tk, "VolAnn"] * 100,
+        dfm.loc[tk, "CAGR"] * 100,
+        s=sizes.loc[tk],
+        color=colors.get(tk, None),
+        alpha=0.8,
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    ax3.text(
+        dfm.loc[tk, "VolAnn"] * 100,
+        dfm.loc[tk, "CAGR"] * 100,
+        f" {tk}",
+        va="center",
+        ha="left",
+        fontsize=10,
+        weight="bold"
+    )
+
+ax3.set_title("Risco x Retorno — Volatilidade (X) vs CAGR (Y)\nTamanho ∝ Volume Médio (sem legenda)")
+ax3.set_xlabel("Volatilidade Anualizada (%)")
+ax3.set_ylabel("CAGR (%)")
+ax3.set_xlim(10, 60)
+ax3.set_ylim(0, 20)
+ax3.text(0.5, -0.12, "Fonte: Yahoo Finance / Elaboração: Santa Fé Investimentos",
+         ha="center", va="center", transform=ax3.transAxes, fontsize=10, style='italic')
+plt.tight_layout()
+
+# --------------------------
+# Resumo no console
+# --------------------------
+summary = dfm.copy()
+summary["CAGR_%"] = (summary["CAGR"] * 100).round(2)
+summary["VolAnn_%"] = (summary["VolAnn"] * 100).round(2)
+summary["MDD_%"] = (summary["MDD"] * 100).round(2)
+print("\nResumo de Métricas (desde 01/01/2000):")
+print(summary[["CAGR_%", "VolAnn_%", "MDD_%", "AvgVolume"]].round(2))
+
+plt.show()
